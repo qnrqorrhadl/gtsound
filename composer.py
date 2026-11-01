@@ -4,12 +4,27 @@
 - 이미 있는 음의 몸통을 클릭하면 지워져요.
 - 필요한 설치: pip install pygame numpy
 """
+import hashlib
 import json
+import os
+import queue
+import subprocess
+import sys
+import threading
 import tkinter as tk
+import urllib.request
 from tkinter import filedialog, messagebox
 
 import numpy as np
 import pygame
+
+# ---------- 업데이트 설정 ----------
+# ↓ 본인의 'GitHub아이디/저장소이름'으로 바꿔주세요. (공개 저장소여야 해요)
+#   바꾸기 전에는 업데이트 확인을 하지 않아요.
+GITHUB_REPO = "아이디/저장소이름"
+USER_AGENT = "composer-updater"
+BACKUP_NAME = "composer_backup.exe"   # 업데이트 때 이전 버전이 이 이름으로 남아요
+NEW_NAME = "composer_new.exe"         # 받는 중인 새 버전의 임시 이름
 
 # ---------- 설정 ----------
 ROWS = 24            # 음 높이 칸 수 (2옥타브)
@@ -50,10 +65,116 @@ def make_tone(freq, seconds):
     return pygame.sndarray.make_sound(data)
 
 
+# ---------- 업데이트 도우미 ----------
+def get_version():
+    """exe를 만들 때 자동으로 들어가는 버전 번호. 파이썬으로 직접 실행하면 'dev'."""
+    base = getattr(sys, "_MEIPASS", None)
+    if not base:
+        return "dev"
+    try:
+        with open(os.path.join(base, "version.txt"), encoding="utf-8-sig") as f:
+            text = f.read().strip()
+    except OSError:
+        return "dev"
+    return text if text.isdigit() else "dev"
+
+
+def fetch_latest_release(repo):
+    """내 저장소의 최신 Release 정보를 가져온다. 주소가 내 저장소가 아니면 거부한다."""
+    url = f"https://api.github.com/repos/{repo}/releases/latest"
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT,
+                                               "Accept": "application/vnd.github+json"})
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        data = json.load(resp)
+    tag = str(data.get("tag_name", ""))
+    if not (tag.startswith("v") and tag[1:].isdigit()):
+        return None
+    prefix = f"https://github.com/{repo}/releases/download/"
+    assets = {a.get("name"): a.get("browser_download_url", "") for a in data.get("assets", [])}
+    exe_url = assets.get("composer.exe", "")
+    sha_url = assets.get("composer.exe.sha256", "")
+    if not (exe_url.startswith(prefix) and sha_url.startswith(prefix)):
+        return None
+    return {"version": int(tag[1:]), "exe_url": exe_url, "sha_url": sha_url}
+
+
+def sha256_of(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def verify_exe(path, expected):
+    """받은 파일이 정상인지 확인: 체크섬 형식, 크기, 윈도우 실행 파일 표시(MZ), 체크섬 일치"""
+    if len(expected) != 64 or any(ch not in "0123456789abcdef" for ch in expected):
+        return False
+    if os.path.getsize(path) < 1_000_000:
+        return False
+    with open(path, "rb") as f:
+        if f.read(2) != b"MZ":
+            return False
+    return sha256_of(path) == expected
+
+
+def download_file(url, dest):
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        if not resp.geturl().startswith("https://"):
+            raise ValueError("안전하지 않은 주소예요")
+        with open(dest, "wb") as f:
+            while True:
+                chunk = resp.read(256 * 1024)
+                if not chunk:
+                    break
+                f.write(chunk)
+
+
+def update_worker(info, new_path, q):
+    """(별도 작업 줄에서) 체크섬과 새 exe를 받아 확인한다. 결과는 q로 알려준다."""
+    try:
+        req = urllib.request.Request(info["sha_url"], headers={"User-Agent": USER_AGENT})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            if not resp.geturl().startswith("https://"):
+                raise ValueError("안전하지 않은 주소예요")
+            expected = resp.read(200).decode("ascii", "ignore").split()[0].lower()
+        download_file(info["exe_url"], new_path)
+        if not verify_exe(new_path, expected):
+            raise ValueError("받은 파일이 올바르지 않아요 (체크섬 불일치)")
+        q.put(("ok", new_path))
+    except Exception as e:
+        try:
+            os.remove(new_path)
+        except OSError:
+            pass
+        q.put(("error", str(e)))
+
+
+def apply_update(new_path):
+    """실행 중인 exe를 백업해 두고 새 exe로 바꾼 뒤 다시 실행한다. 실패하면 되돌린다.
+    (윈도우는 실행 중인 exe를 지울 수는 없어도 이름은 바꿀 수 있어요)"""
+    current = sys.executable
+    backup = os.path.join(os.path.dirname(current), BACKUP_NAME)
+    os.replace(current, backup)
+    try:
+        os.replace(new_path, current)
+    except Exception:
+        os.replace(backup, current)   # 되돌리기
+        raise
+    env = dict(os.environ)
+    env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"   # 새 exe가 이전 실행 흔적을 물려받지 않게
+    subprocess.Popen([current], env=env, close_fds=True)
+
+
 class ComposerApp:
     def __init__(self, root):
         self.root = root
-        root.title("쉬운 작곡 프로그램")
+        self.version = get_version()
+        root.title("쉬운 작곡 프로그램" if self.version == "dev"
+                   else f"쉬운 작곡 프로그램 v{self.version}")
+        self.update_q = queue.Queue()
+        self.wait_win = None
 
         pygame.mixer.pre_init(SAMPLE_RATE, -16, 1, 512)
         pygame.mixer.init()
@@ -70,6 +191,7 @@ class ComposerApp:
         self.build_canvas()
         self.draw_grid()
         self.draw_notes()
+        self.root.after(1500, self.check_update)   # 켜진 뒤 잠깐 있다가 새 버전 확인
 
     # ---------- 화면 만들기 ----------
     def build_controls(self):
@@ -290,6 +412,79 @@ class ComposerApp:
         self.stop()
         self.notes = []
         self.draw_notes()
+
+    # ---------- 업데이트 ----------
+    def check_update(self):
+        """exe로 실행 중일 때만, 새 버전이 있는지 조용히 확인한다."""
+        if not getattr(sys, "frozen", False) or self.version == "dev":
+            return
+        if GITHUB_REPO.startswith("아이디"):
+            return
+        threading.Thread(target=self._check_worker, daemon=True).start()
+        self.root.after(500, self.poll_update)
+
+    def _check_worker(self):
+        try:
+            info = fetch_latest_release(GITHUB_REPO)
+            if info and info["version"] > int(self.version):
+                self.update_q.put(("found", info))
+                return
+        except Exception:
+            pass                       # 인터넷이 없거나 실패해도 조용히 넘어간다
+        self.update_q.put(("none", None))
+
+    def poll_update(self):
+        try:
+            kind, value = self.update_q.get_nowait()
+        except queue.Empty:
+            self.root.after(500, self.poll_update)
+            return
+        if kind == "found":
+            self.ask_update(value)
+        elif kind == "ok":
+            self.finish_update(value)
+        elif kind == "error":
+            self.update_failed(value)
+
+    def ask_update(self, info):
+        ok = messagebox.askyesno(
+            "업데이트",
+            f"새 버전(v{info['version']})이 있어요.\n지금 받아서 바꿀까요?\n\n"
+            f"(지금 버전은 v{self.version}이고, 이전 버전은 {BACKUP_NAME}로 남겨둬요)")
+        if not ok:
+            return
+        self.stop()
+        self.wait_win = tk.Toplevel(self.root)
+        self.wait_win.title("업데이트")
+        tk.Label(self.wait_win, text="새 버전을 받는 중이에요...\n잠시만 기다려 주세요.",
+                 padx=30, pady=20).pack()
+        new_path = os.path.join(os.path.dirname(sys.executable), NEW_NAME)
+        threading.Thread(target=update_worker, args=(info, new_path, self.update_q),
+                         daemon=True).start()
+        self.root.after(500, self.poll_update)
+
+    def close_wait_win(self):
+        if self.wait_win is not None:
+            self.wait_win.destroy()
+            self.wait_win = None
+
+    def finish_update(self, new_path):
+        self.close_wait_win()
+        try:
+            apply_update(new_path)
+        except Exception as e:
+            try:
+                os.remove(new_path)
+            except OSError:
+                pass
+            self.update_failed(str(e))
+            return
+        self.root.destroy()            # 새 버전이 이미 실행됐으니 이전 창은 닫는다
+
+    def update_failed(self, reason):
+        self.close_wait_win()
+        messagebox.showerror("업데이트 실패",
+                             f"업데이트를 하지 못했어요. 지금 버전은 그대로 쓸 수 있어요.\n\n(사유: {reason})")
 
     # ---------- 저장 / 불러오기 ----------
     def save_song(self):
