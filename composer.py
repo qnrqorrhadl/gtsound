@@ -35,6 +35,9 @@ def make_tone(freq, seconds=0.6):
     wave = wave * envelope * attack
     wave = wave / np.max(np.abs(wave)) * 0.4
     data = (wave * 32767).astype(np.int16)
+    channels = pygame.mixer.get_init()[2]
+    if channels == 2:
+        data = np.column_stack((data, data))  # 스테레오면 같은 소리를 양쪽에 넣기
     return pygame.sndarray.make_sound(data)
 
 
