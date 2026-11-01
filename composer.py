@@ -21,7 +21,7 @@ import pygame
 # ---------- 업데이트 설정 ----------
 # ↓ 본인의 'GitHub아이디/저장소이름'으로 바꿔주세요. (공개 저장소여야 해요)
 #   바꾸기 전에는 업데이트 확인을 하지 않아요.
-GITHUB_REPO = "아이디/저장소이름"
+GITHUB_REPO = "qnrqorrhadl/gtsound"
 USER_AGENT = "composer-updater"
 BACKUP_NAME = "composer_backup.exe"   # 업데이트 때 이전 버전이 이 이름으로 남아요
 NEW_NAME = "composer_new.exe"         # 받는 중인 새 버전의 임시 이름
