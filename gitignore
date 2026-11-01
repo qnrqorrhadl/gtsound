@@ -1,0 +1,12 @@
+# 파이썬 임시 파일
+__pycache__/
+*.pyc
+
+# 가상환경
+venv/
+.venv/
+
+# .exe 만들 때 생기는 폴더와 파일
+build/
+dist/
+*.spec
